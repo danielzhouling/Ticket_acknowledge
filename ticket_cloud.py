@@ -152,6 +152,21 @@ async def run_automation():
             # 视图切换
             try:
                 log.info("🔄 [DEBUG] 点击 FRG ITS - Dmall 按钮...")
+
+                # 先截图看看页面内容
+                await page.screenshot(path="debug_page.png")
+                log.info("📸 [DEBUG] 已截图保存到 debug_page.png")
+
+                # 打印页面所有按钮
+                buttons = await page.get_by_role("button").all()
+                log.info(f"🔍 [DEBUG] 页面共有 {len(buttons)} 个按钮:")
+                for btn in buttons[:10]:
+                    try:
+                        name = (await btn.inner_text()).strip()
+                        if name:
+                            log.info(f"  按钮: {name}")
+                    except: pass
+
                 await page.get_by_role("button", name="FRG ITS - Dmall").first.click()
                 await page.wait_for_timeout(6000)
                 log.info("✅ [DEBUG] 视图切换完成")
