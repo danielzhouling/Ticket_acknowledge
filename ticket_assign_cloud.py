@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 # 2. [CLOUD] 添加反检测参数：--disable-blink-features=AutomationControlled
 # 3. [CLOUD] 添加安全参数：--no-sandbox, --disable-dev-shm-usage
 # 4. 保留原版所有功能：模板选择、收件人兜底、飞书同步
+# 5. 增加详细日志，便于排查问题
 # =========================================================
 
 def setup_logger():
@@ -22,16 +23,16 @@ def setup_logger():
     if not os.path.exists(log_dir): os.makedirs(log_dir)
     formatter = logging.Formatter('[%(asctime)s] [%(levelname)s] [%(funcName)s:%(lineno)d]: %(message)s')
     logger = logging.getLogger("DmallFinalFix")
-    logger.setLevel(logging.INFO)
-    
+    logger.setLevel(logging.DEBUG)
+
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
+    console_handler.setLevel(logging.DEBUG)
     console_handler.setFormatter(formatter)
-    
+
     info_handler = TimedRotatingFileHandler(os.path.join(log_dir, "operation_detail.log"), when="midnight", interval=1, backupCount=30, encoding="utf-8")
-    info_handler.setLevel(logging.INFO)
+    info_handler.setLevel(logging.DEBUG)
     info_handler.setFormatter(formatter)
-    
+
     logger.addHandler(console_handler)
     logger.addHandler(info_handler)
     return logger
@@ -49,22 +50,36 @@ class FeishuClient:
 
     def _get_token(self):
         url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+        log.info(f"📡 [DEBUG] 获取飞书 token, url={url}")
         try:
             res = requests.post(url, json={"app_id": self.app_id, "app_secret": self.app_secret}).json()
-            return res.get("tenant_access_token") if res.get("code") == 0 else None
-        except: return None
+            if res.get("code") == 0:
+                log.info("📡 [DEBUG] 飞书 token 获取成功")
+                return res.get("tenant_access_token")
+            else:
+                log.error(f"📡 [ERROR] 飞书 token 获取失败: {res}")
+                return None
+        except Exception as e:
+            log.error(f"📡 [ERROR] 获取飞书 token 异常: {e}")
+            return None
 
     def get_record_id(self, ticket_no):
+        log.info(f"📡 [DEBUG] 查询飞书记录ID: {ticket_no}")
         if not self.token: return None
         url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{self.app_token}/tables/{self.table_id}/records/search"
         try:
-            res = requests.post(url, headers={"Authorization": f"Bearer {self.token}"}, 
+            res = requests.post(url, headers={"Authorization": f"Bearer {self.token}"},
                                 json={"filter": {"conjunction": "and", "conditions": [{"field_name": "Ticket No", "operator": "contains", "value": [str(ticket_no)]}]}}).json()
             items = res.get("data", {}).get("items", [])
-            return items[0].get("record_id") if items else None
-        except: return None
+            record_id = items[0].get("record_id") if items else None
+            log.info(f"📡 [DEBUG] 飞书记录ID: {ticket_no} -> {record_id}")
+            return record_id
+        except Exception as e:
+            log.error(f"📡 [ERROR] 查询飞书记录ID异常: {e}")
+            return None
 
     def upsert_record(self, fields, record_id=None):
+        log.info(f"📡 [DEBUG] 准备同步到飞书: {fields['Ticket No']['text']}, record_id={record_id}")
         if not self.token: return
         if record_id:
             url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{self.app_token}/tables/{self.table_id}/records/batch_update"
@@ -94,11 +109,19 @@ def parse_sdp_date(date_str):
     except: return int(datetime.now().timestamp() * 1000)
 
 async def run_automation():
+    log.info("="*50)
+    log.info("🚀 [V6.3.3 Cloud] 启动修复后的全自动流程...")
+    log.info("="*50)
+
+    auth_file = "auth.json"
+    feishu = FeishuClient()
+    base_url = os.getenv("SDP_BASE_URL")
+
+    log.info(f"📝 [DEBUG] SDP_BASE_URL={base_url}")
+    log.info(f"📝 [DEBUG] auth_file exists: {os.path.exists(auth_file)}")
+
     async with async_playwright() as p:
-        log.info("🚀 [V6.3.3] 启动修复后的全自动流程...")
-        auth_file = "auth.json"
-        feishu = FeishuClient()
-        
+        log.info("🌐 [DEBUG] 启动 Chromium 浏览器...")
         browser = await p.chromium.launch(
             headless=True,
             args=[
@@ -108,42 +131,69 @@ async def run_automation():
                 '--disable-gpu'
             ]
         )
+        log.info("✅ [DEBUG] 浏览器启动成功")
+
         context = await browser.new_context(storage_state=auth_file) if os.path.exists(auth_file) else await browser.new_context()
+        log.info(f"✅ [DEBUG] 浏览器上下文创建成功")
+
         page = await context.new_page()
         page.set_default_timeout(60000)
-        base_url = os.getenv("SDP_BASE_URL")
+        log.info("✅ [DEBUG] 新页面创建成功")
 
         try:
-            log.info("🌐 正在访问 SDP 列表...")
+            log.info(f"🌐 [DEBUG] 访问 SDP: {base_url}/app/itdesk/ui/requests")
             await page.goto(base_url + "/app/itdesk/ui/requests", wait_until="domcontentloaded")
-            
+            log.info("✅ [DEBUG] 页面加载完成")
+
+            # 检查登录
             try:
+                log.info("🔍 [DEBUG] 检查登录状态...")
                 target = await page.wait_for_selector("#searchReq, .requestlistview_header, #userNameInput", timeout=20000)
-                if await target.get_attribute("id") == "userNameInput":
+                element_id = await target.get_attribute("id")
+                log.info(f"🔍 [DEBUG] 检测到元素 id: {element_id}")
+
+                if element_id == "userNameInput":
+                    log.info("🔐 [INFO] 需要登录，执行自动登录...")
                     await page.locator("#userNameInput").fill(os.getenv("SDP_USERNAME"))
                     await page.locator("#passwordInput").fill(os.getenv("SDP_PASSWORD"))
                     await page.locator("#submitButton").click()
+                    log.info("✅ [INFO] 登录表单已提交，等待 10 秒...")
                     await page.wait_for_timeout(10000)
                     await context.storage_state(path=auth_file)
-            except: pass
+                    log.info(f"✅ [INFO] 登录状态已保存到 {auth_file}")
+                else:
+                    log.info("✅ [INFO] 已登录，跳过登录步骤")
+            except Exception as e:
+                log.warning(f"⚠️ [WARNING] 登录检查异常: {e}，可能已登录")
 
-            # --- 筛选逻辑 ---
+            # 筛选逻辑
             try:
+                log.info("🔄 [DEBUG] 点击 FRG ITS - Dmall 按钮...")
                 await page.get_by_role("button", name="FRG ITS - Dmall").first.click(); await page.wait_for_timeout(6000)
+
+                log.info("🔄 [DEBUG] 点击排序按钮...")
                 sort_h = page.locator('th[data-column-index="7"]').first
                 await sort_h.click(force=True); await page.wait_for_timeout(4000)
                 await sort_h.click(force=True); await page.wait_for_timeout(5000)
+
+                log.info("🔄 [DEBUG] 打开搜索面板...")
                 await page.locator('span[data-sdp-table-id="search-btn"]').first.click(); await page.wait_for_timeout(3000)
+
+                log.info("🔄 [DEBUG] 输入搜索条件: status=Assigned")
                 await page.locator('div[data-search-field-name="status"] input').first.fill("Assigned")
                 await page.locator(".sdp-table-search-go button").first.click(); await page.wait_for_timeout(10000)
-            except: pass
+                log.info("✅ [DEBUG] 搜索完成")
+            except Exception as e:
+                log.warning(f"⚠️ [WARNING] 筛选逻辑异常: {e}")
 
-            # --- 抓取逻辑 ---
+            # 抓取逻辑
+            log.info("🔍 [DEBUG] 开始抓取工单数据...")
             tickets = await page.evaluate(r"""() => {
                 const results = [];
                 const seenNo = new Set();
                 const links = Array.from(document.querySelectorAll('a'))
                                    .filter(a => /\/app\/itdesk\/ui\/requests\/\d+\/details/.test(a.href));
+                console.log('Found links:', links.length);
                 links.forEach(link => {
                     const row = link.closest('tr');
                     if (row) {
@@ -161,61 +211,75 @@ async def run_automation():
                 return results;
             }""")
 
-            log.info(f"📊 扫描完毕: 发现 {len(tickets)} 个唯一待处理工单")
+            log.info(f"📊 [DEBUG] 扫描完毕: 发现 {len(tickets)} 个唯一待处理工单")
+            if len(tickets) > 0:
+                log.info(f"📋 [DEBUG] 工单列表: {tickets}")
+
+            if len(tickets) == 0:
+                log.warning("⚠️ [WARNING] 未发现任何 Assigned 状态的待处理工单")
 
             for t in tickets:
                 log.info(f"--- 🛠️ 处理工单: {t['no']} ---")
                 record_id = feishu.get_record_id(t['no'])
-                
+                log.info(f"📡 [DEBUG] 飞书记录ID: {record_id}")
+
                 try:
-                    log.info(f"🔗 跳转详情页...")
+                    log.info(f"🔗 [DEBUG] 跳转详情页: {t['url']}")
                     await page.goto(t['url'], wait_until="domcontentloaded", timeout=60000)
-                    
-                    log.info("🖱️ 点击 'Reply All'...")
+                    log.info("✅ [DEBUG] 详情页加载完成")
+
+                    log.info("🖱️ [DEBUG] 点击 'Reply All'...")
                     reply_btn = page.get_by_text("Reply All")
                     await reply_btn.wait_for(state="visible", timeout=30000)
                     await reply_btn.click()
                     await asyncio.sleep(5)
-                    
-                    log.info("🖱️ 激活模板选择下拉框...")
+                    log.info("✅ [DEBUG] Reply All 点击完成")
+
+                    log.info("🖱️ [DEBUG] 激活模板选择下拉框...")
                     template_trigger = page.locator("span:has-text('Default Reply Template'), #template_selector_link").first
                     await template_trigger.click()
-                    await asyncio.sleep(3) 
+                    await asyncio.sleep(3)
 
-                    # --- 根据截图 HTML 修复的核心定位 ---
-                    log.info("🖱️ 精准点击可见的模板选项 (.select2-result-label)...")
-                    # 我们只点击类名为 select2-result-label 且文本匹配的 div，这会完美避开隐藏的 span
+                    log.info("🖱️ [DEBUG] 精准点击可见的模板选项 (.select2-result-label)...")
                     target_template = page.locator(".select2-result-label").filter(has_text="Default Reply Template").first
                     await target_template.wait_for(state="visible", timeout=5000)
                     await target_template.click()
-                    
-                    try: 
+                    log.info("✅ [DEBUG] 模板选择完成")
+
+                    try:
                         yes_btn = page.locator("button:has-text('Yes')")
-                        if await yes_btn.is_visible(timeout=3000): await yes_btn.click()
+                        if await yes_btn.is_visible(timeout=3000):
+                            await yes_btn.click()
+                            log.info("✅ [DEBUG] 点击 Yes 确认")
                     except: pass
                     await asyncio.sleep(3)
 
                     # 收件人补全
+                    log.info("📧 [DEBUG] 检查收件人地址...")
                     to_input = page.locator("input#to")
-                    if not (await to_input.input_value()):
-                        log.info("⚠️ 补全收件人地址...")
+                    current_to = await to_input.input_value()
+                    log.info(f"📧 [DEBUG] 当前收件人: '{current_to}'")
+                    if not current_to:
+                        log.info("⚠️ [DEBUG] 收件人为空，填充默认地址...")
                         await to_input.fill("smm.its.pos@smmarkets.com.ph")
-                    
-                    log.info("🚀 发送 Acknowledge...")
+                    else:
+                        log.info("✅ [DEBUG] 收件人已存在")
+
+                    log.info("🚀 [DEBUG] 点击 Send 按钮...")
                     await page.locator("button:has-text('Send')").first.click()
-                    log.info(f"✅ 邮件处理成功")
+                    log.info(f"✅ 邮件处理成功: {t['no']}")
                     await page.wait_for_timeout(4000)
-                    
+
                 except Exception as e:
                     log.error(f"❌ [SDP ERROR] 工单 {t['no']} 操作失败: {e}")
-                
+
                 # 飞书同步
                 feishu_status = "Active Work In Progress" if record_id else "Following"
                 fields = {
-                    "Ticket No": {"text": t['no'], "link": t['url']}, 
-                    "Subject": t['subject'], 
-                    "Priority": PRIORITY_MAP.get(t['priority'], "P3"), 
-                    "Create date": parse_sdp_date(t['date']), 
+                    "Ticket No": {"text": t['no'], "link": t['url']},
+                    "Subject": t['subject'],
+                    "Priority": PRIORITY_MAP.get(t['priority'], "P3"),
+                    "Create date": parse_sdp_date(t['date']),
                     "Status": feishu_status
                 }
                 feishu.upsert_record(fields, record_id)
