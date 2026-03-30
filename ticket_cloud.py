@@ -120,11 +120,12 @@ async def run_automation():
         log.info(f"✅ [DEBUG] 浏览器上下文创建成功, has_storage_state: {os.path.exists(auth_file)}")
 
         page = await context.new_page()
+        page.set_default_timeout(120000)  # 增加超时到120秒
         log.info("✅ [DEBUG] 新页面创建成功")
 
         try:
             log.info(f"🌐 [DEBUG] 访问 SDP: {base_url}/app/itdesk/ui/requests")
-            await page.goto(base_url + "/app/itdesk/ui/requests")
+            await page.goto(base_url + "/app/itdesk/ui/requests", wait_until="domcontentloaded", timeout=120000)
             log.info("✅ [DEBUG] 页面加载完成")
 
             # 检查是否需要登录
